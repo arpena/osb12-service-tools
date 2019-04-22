@@ -14,6 +14,9 @@
 #   - Solucionado el problema de actualizacion de las politicas de seguridad
 #   - Los campos boolean (SI/NO) pueden estar en minusculas en el archivo
 #   - Los headers de los archivos se graban como comentarios (empezando con #) para evitar leerlos al procesar el archivo
+# Version 1.2:
+#   - Agregado verificacion Bug 29469271 - Issue with Services After Importing Projects From 11g to 12c 
+#   - Un poco de refactoring
 # Falta:
 #   - Verificar el cumplimento de las reglas de seguridad informatica en las politicas de seguridad
 #   - Agregar el modo de insercion de un usuario nuevo a un proxy en particular sin necesidad de ir por la modificacion del csv
@@ -64,6 +67,7 @@ from com.bea.wli.sb.transports.tuxedo import TuxedoUtil
 from com.bea.wli.sb.transports.jca import JCATransportUtils
 from com.bea.wli.sb.transports.jms import JmsUtil
 import codecs
+import re
 
 # Configuracion
 file_reporte_proxys = 'reporteProxyServices.csv'
@@ -98,6 +102,59 @@ def close_connection(conn, for_update):
     if for_update:
         discard_session()
     conn.close()
+
+def get_conf_mbean(conn, mbean_class, sessionId):
+    conf_name = ObjectName("com.bea:Name=" + mbean_class.NAME + sessionId  + ",Type=" + mbean_class.TYPE)
+    mbeans = HashSet()
+    mbeans.addAll( conn.queryNames(conf_name, None) )
+    return  MBeanServerInvocationHandler.newProxyInstance(conn, mbeans.iterator().next(), mbean_class, false)
+
+def set_security_policy(ref, policy):
+    if policy != 'None':
+        policyHolder = service_security_conf_mbean.newAccessControlPolicyHolderInstance("XACMLAuthorizer")
+        policyHolder.setPolicyExpression(policy)
+        policyScope = service_security_conf_mbean.newTransportPolicyScope(ref)
+        service_security_conf_mbean.setAccessControlPolicy(policyScope,policyHolder)
+        return True
+    return False
+
+def get_servicebus_mbeans(conn, for_update):
+    global domain_service, alsb_core, service_conf_mbean, session_mgmt_mbean
+    global service_security_conf_mbean, xacmlauth, default_auth, pipeline_conf_mbean
+    
+    domain_service = MBeanServerInvocationHandler.newProxyInstance(conn, ObjectName(DomainRuntimeServiceMBean.OBJECT_NAME))
+    sec_config = domain_service.getDomainConfiguration().getSecurityConfiguration()
+    default_auth = sec_config.getDefaultRealm().lookupAuthenticationProvider('DefaultAuthenticator')
+    session_mgmt_mbean = domain_service.findService(SessionManagementMBean.NAME, SessionManagementMBean.TYPE, None)
+    if for_update:
+        session_id = '.' + session_name
+        create_session()
+    else:
+        session_id = ''
+    alsb_core = get_conf_mbean(conn, ALSBConfigurationMBean, session_id)
+    service_conf_mbean = get_conf_mbean(conn, ServiceConfigurationMBean, session_id)
+    pipeline_conf_mbean = get_conf_mbean(conn, PipelineConfigurationMBean, session_id)
+    
+    service_security_conf_mbean = get_conf_mbean(conn, ServiceSecurityConfigurationMBean, session_id)
+    xacmlauth = service_security_conf_mbean.newAuthorizationProviderIdentifier("XACMLAuthorizer")
+
+def connect_to_jmx(server, listen_port, user_name, password, for_update):
+    connector = get_mbean_server_connection(server, int(listen_port), user_name, password)
+    conn = connector.getMBeanServerConnection()
+    get_servicebus_mbeans(conn,for_update)
+    return connector
+
+def discard_session():
+    if session_mgmt_mbean.sessionExists(session_name):
+        session_mgmt_mbean.discardSession(session_name)
+
+def activate_session(comment):
+    if session_mgmt_mbean.sessionExists(session_name):
+        session_mgmt_mbean.activateSession(session_name, comment)
+
+def create_session():
+    discard_session()
+    session_mgmt_mbean.createSession(session_name)
 
 def get_provider_specific(protocolo, endpoint_conf):
     provider_specific = ''
@@ -139,7 +196,27 @@ def set_workmanager(protocolo, endpoint_conf, wm):
         return True
     return False
 
-def list_business_services(ref):
+def list_all_refs():
+    all_refs = alsb_core.getRefs(Ref.DOMAIN)
+    for r in all_refs:
+        if r.getTypeId() == "BusinessService":
+            list_business_service(r)
+        if r.getTypeId() == "ProxyService":
+            list_proxy_service(r)
+        if r.getTypeId() == "Pipeline":
+            list_pipeline(r)
+    cross_reference_pipelines()
+
+def cross_reference_pipelines():
+    if verbose:
+        print "Analizando Llamadas Locales a Pipelines sin Operacion o Selector...."
+    for k,v in pipelines.items():
+        for p in v['callsLocalPipeline']:
+            if pipelines[p]['numBranches'] != 0 and pipelines[p]['selectorType'] == '-':
+                pipelines[p]['needsSelector'] = 'SI'
+                pipelines[k]['callsLocalNoOp'] = 'SI'
+
+def list_business_service(ref):
     global wmDefault, businessFullTrace, businessHeadersTrace, connTimeOut, readTimeOut
     bs = ref.getFullName()
     if verbose:
@@ -190,7 +267,7 @@ def list_business_services(ref):
         elif traceLevel == "Headers":
             businessHeadersTrace = businessHeadersTrace + 1
 
-def list_proxy_services(ref):
+def list_proxy_service(ref):
     global proxyFullTrace, proxyHeadersTrace
     ps = ref.getFullName()
     if verbose:
@@ -227,7 +304,28 @@ def list_proxy_services(ref):
         elif traceLevel == "Headers":
             proxysHeadersTrace = proxysHeadersTrace + 1
 
-def list_pipelines(ref):
+def get_calls_pipeline_no_op(ns, match):
+    pipes = []
+    for m in match:
+        s = m.selectChildren(ns, "service")
+        ref = s[0].selectAttribute(javax.xml.namespace.QName("ref")).getStringValue()
+        reftype = s[0].selectAttribute(javax.xml.namespace.QName("http://www.w3.org/2001/XMLSchema-instance","type")).getStringValue()
+        o = m.selectChildren(ns, "operation")
+        if reftype == 'con:PipelineRef' and len(o) == 0:
+            pipes.append(ref)
+    return pipes
+
+def get_local_pipeline_calls(xml):
+    localpipes = []
+    ns = "http://www.bea.com/wli/sb/stages/routing/config"
+    match = xml.selectPath("declare namespace rt='"+ns+"'; //rt:route")
+    localpipes.extend(get_calls_pipeline_no_op(ns, match))
+    ns = "http://www.bea.com/wli/sb/stages/transform/config"
+    match = xml.selectPath("declare namespace tr='"+ns+"'; //tr:wsCallout")
+    localpipes.extend(get_calls_pipeline_no_op(ns, match))
+    return localpipes
+
+def list_pipeline(ref):
     global pipelinesEnDebug
     pl = ref.getFullName()
     if verbose:
@@ -235,9 +333,15 @@ def list_pipelines(ref):
     pipelines[pl] = {}
     pipelines[pl]['logLevel'] = '-'
     pipelines[pl]['traceEnabled'] = 'NO'
+    pipelines[pl]['callsLocalPipeline'] = 'NO'
+    pipelines[pl]['selectorType'] = '-'
+    # Estas dos propiedades se completan en cross_reference_pipelines
+    pipelines[pl]['needsSelector'] = 'NO'
+    pipelines[pl]['callsLocalNoOp'] = 'NO'
     
     pipeline_def = pipeline_conf_mbean.getEntry(ref).getPipelineEntry()
     core_entry = pipeline_def.getCoreEntry()
+    binding_entry = core_entry.getBinding()
     operations = PipelineOperationsBean(pipeline_def.getCoreEntry().getOperations())
     if operations.getTracingEnabled():
         pipelines[pl]['traceEnabled'] = 'SI'
@@ -246,6 +350,11 @@ def list_pipelines(ref):
         pipelines[pl]['logLevel'] = logLevel
         if logLevel == 'DEBUG':
             pipelinesEnDebug = pipelinesEnDebug + 1
+    if binding_entry.getType().toString() in ("SOAP","XML","Any SOAP") and binding_entry.isSetSelector():
+        pipelines[pl]['selectorType'] = binding_entry.getSelector().getType()
+    flow = pipeline_def.getRouter().getFlow()
+    pipelines[pl]['numBranches'] = flow.sizeOfBranchNodeArray()
+    pipelines[pl]['callsLocalPipeline'] = get_local_pipeline_calls(flow)
 
 def save_reports():
     if verbose:
@@ -267,9 +376,9 @@ def save_reports():
     if verbose:
         print "Guardando reporte Pipelines en",file_reporte_pipelines
     f = codecs.open(file_reporte_pipelines,'w','utf-8')
-    f.write("#pipeline,traceEnabled,logLevel\n")
+    f.write("#pipeline,traceEnabled,logLevel,needsSelector,callsLocalNoOp\n")
     for k,v in pipelines.items():
-        f.write(k + ",%(traceEnabled)s,%(logLevel)s\n"%v)
+        f.write(k + ",%(traceEnabled)s,%(logLevel)s,%(needsSelector)s,%(callsLocalNoOp)s\n"%v)
     f.close
 
 def load_pipelines_report():
@@ -285,13 +394,15 @@ def load_pipelines_report():
             ### Split the comma seperated values
             items = line.split(',')
             items = [item.strip() for item in items]
-            if len(items) != 3:
+            if len(items) != 5:
                 print "==>Bad line: %s" % line
-                print "==>Syntax: pipeline,traceEnabled,logLevel"
+                print "==>Syntax: pipeline,traceEnabled,logLevel,needsSelector,callsLocalNoOp"
             else:
                 pipelines[items[0]] = {} 
                 pipelines[items[0]]['traceEnabled'] = boolean_uppercase(items[1], line)
                 pipelines[items[0]]['logLevel'] = logLevel_or_dash(items[2], line)
+                pipelines[items[0]]['needsSelector'] = boolean_uppercase(items[3], line)
+                pipelines[items[0]]['callsLocalNoOp'] = boolean_uppercase(items[4], line)
     except Exception, e:
         print "==>Error Occured"
         print e
@@ -389,71 +500,8 @@ def load_proxys_report():
         print "==>Error Occured"
         print e
 
-def list_all_refs():
-    all_refs = alsb_core.getRefs(Ref.DOMAIN)
-    for r in all_refs:
-        if r.getTypeId() == "BusinessService":
-            list_business_services(r)
-        if r.getTypeId() == "ProxyService":
-            list_proxy_services(r)
-        if r.getTypeId() == "Pipeline":
-            list_pipelines(r)
-
-def get_conf_mbean(conn, mbean_class, sessionId):
-    conf_name = ObjectName("com.bea:Name=" + mbean_class.NAME + sessionId  + ",Type=" + mbean_class.TYPE)
-    mbeans = HashSet()
-    mbeans.addAll( conn.queryNames(conf_name, None) )
-    return  MBeanServerInvocationHandler.newProxyInstance(conn, mbeans.iterator().next(), mbean_class, false)
-
-def set_security_policy(ref, policy):
-    if policy != 'None':
-        policyHolder = service_security_conf_mbean.newAccessControlPolicyHolderInstance("XACMLAuthorizer")
-        policyHolder.setPolicyExpression(policy)
-        policyScope = service_security_conf_mbean.newTransportPolicyScope(ref)
-        service_security_conf_mbean.setAccessControlPolicy(policyScope,policyHolder)
-        return True
-    return False
-	
-def get_servicebus_mbeans(conn, for_update):
-    global domain_service, alsb_core, service_conf_mbean, session_mgmt_mbean
-    global service_security_conf_mbean, xacmlauth, default_auth, pipeline_conf_mbean
-    
-    domain_service = MBeanServerInvocationHandler.newProxyInstance(conn, ObjectName(DomainRuntimeServiceMBean.OBJECT_NAME))
-    sec_config = domain_service.getDomainConfiguration().getSecurityConfiguration()
-    default_auth = sec_config.getDefaultRealm().lookupAuthenticationProvider('DefaultAuthenticator')
-    session_mgmt_mbean = domain_service.findService(SessionManagementMBean.NAME, SessionManagementMBean.TYPE, None)
-    if for_update:
-        session_id = '.' + session_name
-        create_session()
-    else:
-        session_id = ''
-    alsb_core = get_conf_mbean(conn, ALSBConfigurationMBean, session_id)
-    service_conf_mbean = get_conf_mbean(conn, ServiceConfigurationMBean, session_id)
-    pipeline_conf_mbean = get_conf_mbean(conn, PipelineConfigurationMBean, session_id)
-
-    service_security_conf_mbean = get_conf_mbean(conn, ServiceSecurityConfigurationMBean, session_id)
-    xacmlauth = service_security_conf_mbean.newAuthorizationProviderIdentifier("XACMLAuthorizer")
-
-def connect_to_jmx(server, listen_port, user_name, password, for_update):
-    connector = get_mbean_server_connection(server, int(listen_port), user_name, password)
-    conn = connector.getMBeanServerConnection()
-    get_servicebus_mbeans(conn,for_update)
-    return connector
-
-def discard_session():
-    if session_mgmt_mbean.sessionExists(session_name):
-        session_mgmt_mbean.discardSession(session_name)
-
-def activate_session(comment):
-    if session_mgmt_mbean.sessionExists(session_name):
-        session_mgmt_mbean.activateSession(session_name, comment)
-
-def create_session():
-    discard_session()
-    session_mgmt_mbean.createSession(session_name)
-
 def update_configurations(businessfunc, proxyfunc, pipelinefunc, comment):
-    i = 0
+    num_changed = 0
     tanda = 1
     create_session()
 
@@ -468,18 +516,18 @@ def update_configurations(businessfunc, proxyfunc, pipelinefunc, comment):
             changed = pipelinefunc(r)
 
         if changed: 
-            i = i + 1
+            num_changed = num_changed + 1
 
-        if i > mods_per_session:
+        if num_changed > mods_per_session:
             activate_session("Tanda " + str(tanda) + " - " + comment)
             time.sleep(1)
             if verbose:
                 print "---------- COMMIT Tanda " + str(tanda) + " OK ----------"
             create_session()
-            i = 0
+            num_changed = 0
             tanda = tanda + 1
 
-    if i != 0:
+    if num_changed != 0:
         activate_session("Tanda " + str(tanda) + " - " + comment)
         if verbose:
             print "---------- COMMIT Tanda " + str(tanda) + " OK ----------"
@@ -687,6 +735,26 @@ def update_proxy(ref):
 
     return changed
 
+def verify_security_policy(sp):
+    isok = True
+    import re
+    acls = sp.split('|')
+    for acl in acls:
+        op, arg = [part.strip() for part in re.split('[\(\)]', acl) if part.strip()]
+        if op == 'Usr':
+            isok = isok and verify_users(arg)
+        elif op == 'Grp':
+            print "====> Validacion de Grupos no implementada. Grp", arg
+        else:
+            print "====> Validacion de ACL no implementada.", op, arg
+    return isok
+
+def verify_users(arg):
+    isok = True
+    for user in arg.split(','):
+        print user
+    return isok
+
 def usage():
     print "Use: %s [OPTIONS] "%sys.argv[0]
     print "List/Updates the configuration of proxies, business and pipelines of the osb domain."
@@ -758,7 +826,7 @@ def get_parameters():
 
 def main():
     operation, server, listen_port, user_name, password = get_parameters()
-#    operation, server, listen_port, user_name, password = "updatepipe", "127.0.0.1", 7001, "weblogic", "welcome1"
+#    operation, server, listen_port, user_name, password = "list", "127.0.0.1", 7601, "weblogic", "welcome1"
 
     for_update = operation != 'list'
 
