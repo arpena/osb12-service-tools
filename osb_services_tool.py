@@ -17,6 +17,10 @@
 # Version 1.2:
 #   - Agregado verificacion Bug 29469271 - Issue with Services After Importing Projects From 11g to 12c 
 #   - Un poco de refactoring
+# Version 1.3:
+#   - Agregado workaround Bug 29469271 a los route nodes mediante operation pass through
+#   - Se Refactorizaron los metodos de obtener informacion de todos los tipos de componente, para poderlos usar en los metodos de actualizacion
+#   - Se modifico el update de pipelines para usar los nuevos metodos get_*
 # Falta:
 #   - Verificar el cumplimento de las reglas de seguridad informatica en las politicas de seguridad
 #   - Agregar el modo de insercion de un usuario nuevo a un proxy en particular sin necesidad de ir por la modificacion del csv
@@ -54,6 +58,7 @@ from javax.naming import Context
 from weblogic.management.jmx import MBeanServerInvocationHandler
 from weblogic.management.mbeanservers.domainruntime import DomainRuntimeServiceMBean
 from com.bea.wli.config import Ref
+from com.bea.wli.config.resource import ResourceQuery
 from com.bea.wli.sb.management.configuration import ALSBConfigurationMBean, ServiceConfigurationMBean, PipelineConfigurationMBean, OperationalSettingsQuery, ServiceSecurityConfigurationMBean, SessionManagementMBean
 from com.bea.wli.sb.services import ProxyServiceEntryDocument
 from com.oracle.xmlns.servicebus.business.config import BusinessServiceEntryDocument
@@ -172,11 +177,10 @@ def get_provider_specific(protocolo, endpoint_conf):
     if protocolo == "jms":
         provider_specific = JmsUtil.getJmsConfig(endpoint_conf)
     return provider_specific
-    
+
 def get_workmanager(protocolo, endpoint_conf):
     global wmDefault
     workManager = 'None'
-
     provider_specific = get_provider_specific(protocolo, endpoint_conf)
     if provider_specific:
         wm = provider_specific.getDispatchPolicy()
@@ -185,7 +189,6 @@ def get_workmanager(protocolo, endpoint_conf):
            workManager = 'default'
         else:
            workManager = wm
-
     return workManager
 
 def set_workmanager(protocolo, endpoint_conf, wm):
@@ -211,150 +214,149 @@ def cross_reference_pipelines():
     if verbose:
         print "Analizando Llamadas Locales a Pipelines sin Operacion o Selector...."
     for k,v in pipelines.items():
-        for p in v['callsLocalPipeline']:
+        for p in v['callsLocalPipeline'].keys():
             if pipelines[p]['numBranches'] != 0 and pipelines[p]['selectorType'] == '-':
                 pipelines[p]['needsSelector'] = 'SI'
                 pipelines[k]['callsLocalNoOp'] = 'SI'
+        for p in v['routesLocalPipeline'].keys():
+            if pipelines[p]['numBranches'] != 0 and pipelines[p]['selectorType'] == '-':
+                pipelines[p]['needsSelector'] = 'SI'
+                pipelines[k]['routesLocalNoOp'] = 'SI'
+
+def get_business_info(ref):
+    info = {
+        'serviceEnabled': 'NO',
+        'traceLevel': '-',
+        'connectionTimeOut': '-',
+        'readTimeOut': '-' 
+    }
+    business_entry = service_conf_mbean.getBusinessDefinition(ref).getBusinessServiceEntry()
+    endpoint_conf = business_entry.getEndpointConfig()
+    core_entry = business_entry.getCoreEntry()
+    operations = BusinessOperationsBean(core_entry.getOperations())
+    info['protocol'] = endpoint_conf.getProviderId()
+    info['workManager'] = get_workmanager(info['protocol'], endpoint_conf)
+    # Timeouts solo para http
+    if info['protocol'] == "http":
+        http_endpoint_conf = HttpUtil.getHttpConfig(endpoint_conf)
+        http_outbound_props = http_endpoint_conf.getOutboundProperties()
+        if http_outbound_props.isSetConnectionTimeout():
+            info['connectionTimeOut'] = http_outbound_props.getConnectionTimeout()
+        if http_outbound_props.isSetTimeout():
+            info['readTimeOut'] = http_outbound_props.getTimeout()
+    if operations.getEnabled():
+        info['serviceEnabled'] = "SI"
+    if operations.getMessageTracingEnabled():
+        info['traceLevel'] = operations.getMessageTracingLevel()
+    return info
 
 def list_business_service(ref):
     global wmDefault, businessFullTrace, businessHeadersTrace, connTimeOut, readTimeOut
     bs = ref.getFullName()
     if verbose:
         print "Analizando Business Service:",bs
-    business[bs] = {}
-    business[bs]['serviceEnabled'] = "NO"
-    business[bs]['traceLevel'] = "-"
-    business[bs]['connectionTimeOut'] = "-"
-    business[bs]['readTimeOut'] = "-"
-    
-    business_entry = service_conf_mbean.getBusinessDefinition(ref).getBusinessServiceEntry()
-    endpoint_conf = business_entry.getEndpointConfig()
-    core_entry = business_entry.getCoreEntry()
-    operations = BusinessOperationsBean(core_entry.getOperations())
- 
-    protocolo = endpoint_conf.getProviderId()
-    business[bs]['protocol'] = protocolo
-    business[bs]['workManager'] = get_workmanager(protocolo, endpoint_conf)
-
-    # Timeouts solo para http
-    if protocolo == "http":
-        http_endpoint_conf = HttpUtil.getHttpConfig(endpoint_conf)
-        http_outbound_props = http_endpoint_conf.getOutboundProperties()
-        if http_outbound_props.isSetConnectionTimeout():
-            http_connection_to = http_outbound_props.getConnectionTimeout()
-            business[bs]['connectionTimeOut'] = http_connection_to
-            if http_connection_to == 0:
-                connTimeOut = connTimeOut + 1
-        else:
+    business[bs] = get_business_info(ref)
+    if business[bs] == "http":
+        if business[bs]['connectionTimeOut'] in (0, '-'):
             connTimeOut = connTimeOut + 1
-        
-        if http_outbound_props.isSetTimeout():
-            http_read_to = http_outbound_props.getTimeout()
-            business[bs]['readTimeOut'] = http_read_to
-            if http_read_to == 0:
-                readTimeOut = readTimeOut + 1
-        else:
+        if business[bs]['readTimeOut'] in (0, '-'):
             readTimeOut = readTimeOut + 1
-    
-    if operations.getEnabled():
-        business[bs]['serviceEnabled'] = "SI"
+    if business[bs]['traceLevel'] == "Full":
+        businessFullTrace = businessFullTrace + 1
+    elif business[bs]['traceLevel'] == "Headers":
+        businessHeadersTrace = businessHeadersTrace + 1
 
+def get_proxy_info(ref):
+    info = {
+        'traceLevel': '-',
+        'serviceEnabled': 'NO',
+        'securityPolicy': 'None'
+    } 
+    proxy_def = service_conf_mbean.getProxyDefinition(ref).getProxyServiceEntry()
+    endpoint_conf = proxy_def.getEndpointConfig()
+    core_entry = proxy_def.getCoreEntry()
+    operations = ProxyOperationsBean(core_entry.getOperations())
+    info['protocol'] = endpoint_conf.getProviderId()
+    info['workManager'] = get_workmanager(info['protocol'], endpoint_conf)
+    if operations.getEnabled():
+        info['serviceEnabled'] = "SI"
+    if core_entry.isSetSecurity():
+        security_entry = core_entry.getSecurity()
+        access_control = security_entry.getAccessControlPolicies()
+        if access_control and access_control.isSetTransportLevelPolicy():
+            s = service_security_conf_mbean.newTransportPolicyScope(ref)
+            info['securityPolicy'] = service_security_conf_mbean.getAccessControlPolicy(s, xacmlauth).getPolicyExpression()
     if operations.getMessageTracingEnabled():
-        traceLevel = operations.getMessageTracingLevel()
-        business[bs]['traceLevel'] = traceLevel
-        if traceLevel == "Full":
-            businessFullTrace = businessFullTrace + 1
-        elif traceLevel == "Headers":
-            businessHeadersTrace = businessHeadersTrace + 1
+        info['traceLevel'] = operations.getMessageTracingLevel()
+    return info
 
 def list_proxy_service(ref):
     global proxyFullTrace, proxyHeadersTrace
     ps = ref.getFullName()
     if verbose:
         print "Analizando Proxy Service:",ps
-    proxys[ps] = {}
-    proxys[ps]['traceLevel'] = "-"
-    proxys[ps]['serviceEnabled'] = "NO"
-    proxys[ps]['securityPolicy'] = "None"
-    
-    proxy_def = service_conf_mbean.getProxyDefinition(ref).getProxyServiceEntry()
-    endpoint_conf = proxy_def.getEndpointConfig()
-    core_entry = proxy_def.getCoreEntry()
-    operations = ProxyOperationsBean(core_entry.getOperations())
-
-    protocolo = endpoint_conf.getProviderId()
-    proxys[ps]['protocol'] = protocolo
-    proxys[ps]['workManager'] = get_workmanager(protocolo, endpoint_conf)
-
-    if operations.getEnabled():
-      proxys[ps]['serviceEnabled'] = "SI"
-
-    if core_entry.isSetSecurity():
-      security_entry = core_entry.getSecurity()
-      access_control = security_entry.getAccessControlPolicies()
-      if access_control and access_control.isSetTransportLevelPolicy():
-          s = service_security_conf_mbean.newTransportPolicyScope(ref)
-          proxys[ps]['securityPolicy'] = service_security_conf_mbean.getAccessControlPolicy(s, xacmlauth).getPolicyExpression()
-
-    if operations.getMessageTracingEnabled():
-        traceLevel =  operations.getMessageTracingLevel()
-        proxys[ps]['traceLevel'] = traceLevel
-        if traceLevel == "Full":
-            proxysFullTrace = proxysFullTrace + 1
-        elif traceLevel == "Headers":
-            proxysHeadersTrace = proxysHeadersTrace + 1
+    proxys[ps] = get_proxy_info(ref)
+    if proxys[ps]['traceLevel'] == "Full":
+        proxysFullTrace = proxysFullTrace + 1
+    elif proxys[ps]['traceLevel'] == "Headers":
+        proxysHeadersTrace = proxysHeadersTrace + 1
 
 def get_calls_pipeline_no_op(ns, match):
-    pipes = []
+    pipes = {}
     for m in match:
         s = m.selectChildren(ns, "service")
         ref = s[0].selectAttribute(javax.xml.namespace.QName("ref")).getStringValue()
         reftype = s[0].selectAttribute(javax.xml.namespace.QName("http://www.w3.org/2001/XMLSchema-instance","type")).getStringValue()
         o = m.selectChildren(ns, "operation")
         if reftype == 'con:PipelineRef' and len(o) == 0:
-            pipes.append(ref)
+            pipes[ref] = 1
     return pipes
 
 def get_local_pipeline_calls(xml):
-    localpipes = []
-    ns = "http://www.bea.com/wli/sb/stages/routing/config"
-    match = xml.selectPath("declare namespace rt='"+ns+"'; //rt:route")
-    localpipes.extend(get_calls_pipeline_no_op(ns, match))
     ns = "http://www.bea.com/wli/sb/stages/transform/config"
     match = xml.selectPath("declare namespace tr='"+ns+"'; //tr:wsCallout")
-    localpipes.extend(get_calls_pipeline_no_op(ns, match))
-    return localpipes
+    return get_calls_pipeline_no_op(ns, match)
+
+def get_local_pipeline_routes(xml):
+    ns = "http://www.bea.com/wli/sb/stages/routing/config"
+    match = xml.selectPath("declare namespace rt='"+ns+"'; //rt:route")
+    return get_calls_pipeline_no_op(ns, match)
+
+def get_pipeline_info(ref):
+    info = {
+        'logLevel': '-',
+        'traceEnabled': 'NO',
+        'selectorType': '-',
+        # Estas tres propiedades se completan en cross_reference_pipelines
+        'needsSelector': 'NO',
+        'callsLocalNoOp': 'NO',
+        'routesLocalNoOp': 'NO'
+    }
+    pipeline_def = pipeline_conf_mbean.getEntry(ref).getPipelineEntry()
+    core_entry = pipeline_def.getCoreEntry()
+    binding_entry = core_entry.getBinding()
+    operations = PipelineOperationsBean(pipeline_def.getCoreEntry().getOperations())
+    if operations.getTracingEnabled():
+        info['traceEnabled'] = 'SI'
+    if operations.getLoggingEnabled():
+        logLevel = operations.getLoggingLevel()
+        info['logLevel'] = logLevel
+    if binding_entry.getType().toString() in ("SOAP","XML","Any SOAP") and binding_entry.isSetSelector():
+        info['selectorType'] = binding_entry.getSelector().getType()
+    flow = pipeline_def.getRouter().getFlow()
+    info['numBranches'] = flow.sizeOfBranchNodeArray()
+    info['callsLocalPipeline'] = get_local_pipeline_calls(flow)
+    info['routesLocalPipeline'] = get_local_pipeline_routes(flow)
+    return info
 
 def list_pipeline(ref):
     global pipelinesEnDebug
     pl = ref.getFullName()
     if verbose:
         print "Analizando Pipeline:",pl
-    pipelines[pl] = {}
-    pipelines[pl]['logLevel'] = '-'
-    pipelines[pl]['traceEnabled'] = 'NO'
-    pipelines[pl]['callsLocalPipeline'] = 'NO'
-    pipelines[pl]['selectorType'] = '-'
-    # Estas dos propiedades se completan en cross_reference_pipelines
-    pipelines[pl]['needsSelector'] = 'NO'
-    pipelines[pl]['callsLocalNoOp'] = 'NO'
-    
-    pipeline_def = pipeline_conf_mbean.getEntry(ref).getPipelineEntry()
-    core_entry = pipeline_def.getCoreEntry()
-    binding_entry = core_entry.getBinding()
-    operations = PipelineOperationsBean(pipeline_def.getCoreEntry().getOperations())
-    if operations.getTracingEnabled():
-        pipelines[pl]['traceEnabled'] = 'SI'
-    if operations.getLoggingEnabled():
-        logLevel = operations.getLoggingLevel()
-        pipelines[pl]['logLevel'] = logLevel
-        if logLevel == 'DEBUG':
-            pipelinesEnDebug = pipelinesEnDebug + 1
-    if binding_entry.getType().toString() in ("SOAP","XML","Any SOAP") and binding_entry.isSetSelector():
-        pipelines[pl]['selectorType'] = binding_entry.getSelector().getType()
-    flow = pipeline_def.getRouter().getFlow()
-    pipelines[pl]['numBranches'] = flow.sizeOfBranchNodeArray()
-    pipelines[pl]['callsLocalPipeline'] = get_local_pipeline_calls(flow)
+    pipelines[pl] = get_pipeline_info(ref)
+    if pipelines[pl]['logLevel'] == 'DEBUG':
+        pipelinesEnDebug = pipelinesEnDebug + 1
 
 def save_reports():
     if verbose:
@@ -376,9 +378,11 @@ def save_reports():
     if verbose:
         print "Guardando reporte Pipelines en",file_reporte_pipelines
     f = codecs.open(file_reporte_pipelines,'w','utf-8')
-    f.write("#pipeline,traceEnabled,logLevel,needsSelector,callsLocalNoOp\n")
+#    f.write("#pipeline,traceEnabled,logLevel,needsSelector,callsLocalNoOp,numBranches,callsLocalPipeline\n")
+    f.write("#pipeline,traceEnabled,logLevel,needsSelector,routesLocalNoOp,callsLocalNoOp\n")
     for k,v in pipelines.items():
-        f.write(k + ",%(traceEnabled)s,%(logLevel)s,%(needsSelector)s,%(callsLocalNoOp)s\n"%v)
+#        f.write(k + ",%(traceEnabled)s,%(logLevel)s,%(needsSelector)s,%(callsLocalNoOp)s,%(numBranches)s,\"%(callsLocalPipeline)s\"\n"%v)
+        f.write(k + ",%(traceEnabled)s,%(logLevel)s,%(needsSelector)s,%(routesLocalNoOp)s,%(callsLocalNoOp)s\n"%v)
     f.close
 
 def load_pipelines_report():
@@ -394,15 +398,17 @@ def load_pipelines_report():
             ### Split the comma seperated values
             items = line.split(',')
             items = [item.strip() for item in items]
-            if len(items) != 5:
+            if len(items) != 6:
                 print "==>Bad line: %s" % line
-                print "==>Syntax: pipeline,traceEnabled,logLevel,needsSelector,callsLocalNoOp"
+                print "==>Syntax: pipeline,traceEnabled,logLevel,needsSelector,routesLocalNoOp,callsLocalNoOp"
             else:
-                pipelines[items[0]] = {} 
-                pipelines[items[0]]['traceEnabled'] = boolean_uppercase(items[1], line)
-                pipelines[items[0]]['logLevel'] = logLevel_or_dash(items[2], line)
-                pipelines[items[0]]['needsSelector'] = boolean_uppercase(items[3], line)
-                pipelines[items[0]]['callsLocalNoOp'] = boolean_uppercase(items[4], line)
+                pipelines[items[0]] = { 
+                        'traceEnabled': boolean_uppercase(items[1], line),
+                        'logLevel': logLevel_or_dash(items[2], line),
+                        'needsSelector': boolean_uppercase(items[3], line),
+                        'routesLocalNoOp': boolean_uppercase(items[4], line),
+                        'callsLocalNoOp': boolean_uppercase(items[5], line),
+                }
     except Exception, e:
         print "==>Error Occured"
         print e
@@ -455,13 +461,14 @@ def load_business_report():
                 print "==>Bad line: %s" % line
                 print "==>Syntax: businessService,protocol,workManager,enabled,traceLevel,cTimeOut,rTimeOut"
             else:
-                business[items[0]] = {} 
-                business[items[0]]['protocol'] = items[1]
-                business[items[0]]['workManager'] = items[2]
-                business[items[0]]['serviceEnabled'] = boolean_uppercase(items[3], line)
-                business[items[0]]['traceLevel'] = traceLevel_or_dash(items[4], line)
-                business[items[0]]['connectionTimeOut'] = number_or_dash(items[5], line)
-                business[items[0]]['readTimeOut'] = number_or_dash(items[6], line)
+                business[items[0]] = { 
+                        'protocol': items[1],
+                        'workManager': items[2],
+                        'serviceEnabled': boolean_uppercase(items[3], line),
+                        'traceLevel': traceLevel_or_dash(items[4], line),
+                        'connectionTimeOut': number_or_dash(items[5], line),
+                        'readTimeOut': number_or_dash(items[6], line)
+                }
     except Exception, e:
         print "==>Error Occured"
         print e
@@ -490,12 +497,13 @@ def load_proxys_report():
                 print "==>Bad line: %s" % line
                 print "==>Syntax: proxyService,protocol,workManager,enabled,traceLevel,securityPolicy"
             else:
-                proxys[items[0]] = {} 
-                proxys[items[0]]['protocol'] = items[1]
-                proxys[items[0]]['workManager'] = items[2]
-                proxys[items[0]]['serviceEnabled'] = boolean_uppercase(items[3], line)
-                proxys[items[0]]['traceLevel'] = traceLevel_or_dash(items[4], line)
-                proxys[items[0]]['securityPolicy'] = items[5].strip('\"')
+                proxys[items[0]] = { 
+                        'protocol': items[1],
+                        'workManager': items[2],
+                        'serviceEnabled': boolean_uppercase(items[3], line),
+                        'traceLevel': traceLevel_or_dash(items[4], line),
+                        'securityPolicy': items[5].strip('\"')
+                }
     except Exception, e:
         print "==>Error Occured"
         print e
@@ -535,46 +543,92 @@ def update_configurations(businessfunc, proxyfunc, pipelinefunc, comment):
 def no_update(ref):
     return False
 
+def boolean_from_string(s):
+    if s == 'SI':
+        return True
+    return False
+
+def update_pipeline_routes(xml, dest):
+    changed = False
+    # Keep only destinations that are problematic
+    for d in dest.keys():
+        path, localName = os.path.split(d)
+        query = ResourceQuery('Pipeline')
+        query.setPath(path)
+        query.setLocalName(localName)
+        refs = alsb_core.getRefs(query)
+        if refs.size() != 1:
+            if verbose:
+                print "==> No existe el destino del route:", d
+            del dest[d]
+            continue
+        if verbose:
+            print "Evaluando destino route:", d
+        info = get_pipeline_info(refs[0])
+        if info['numBranches'] == 0 or info['selectorType'] != '-':
+            del dest[d]
+
+    ns = "http://www.bea.com/wli/sb/stages/routing/config"
+    match = xml.selectPath("declare namespace rt='"+ns+"'; //rt:route")
+    for m in match:
+        s = m.selectChildren(ns, "service")
+        ref = s[0].selectAttribute(javax.xml.namespace.QName("ref")).getStringValue()
+        reftype = s[0].selectAttribute(javax.xml.namespace.QName("http://www.w3.org/2001/XMLSchema-instance","type")).getStringValue()
+        o = m.selectChildren(ns, "operation")
+        if reftype == 'con:PipelineRef' and len(o) == 0 and ref in dest:
+            if verbose:
+                print "Agregando passThrough al route a", ref
+            addpassThrough(ns, m)
+            changed = True
+    return changed
+
+def addpassThrough(ns, m):
+    cur = m.newCursor()
+    cur.toChild(ns, "service")
+    cur.toNextSibling()
+    cur.beginElement("operation", ns)
+    cur.insertAttributeWithValue("passThrough", "true")
+    cur.dispose()
+
 def update_pipeline(ref):
     pl = ref.getFullName()
     if not pl in pipelines:
         return False
     if verbose:
         print "Evaluando cambios en Pipeline:",pl
-    logLevel = '-'
-    traceEnabled = 'NO'
-    changed = False
-    cambio = ''
-    
-    pipeline_def = pipeline_conf_mbean.getEntry(ref).getPipelineEntry()
+    info = get_pipeline_info(ref)
+    mods = dict([ (k, pipelines[pl][k]) for k in pipelines[pl].keys() if pipelines[pl][k] != info[k] ])
+    if not mods:
+        return False
+
+    pipeline_entry = pipeline_conf_mbean.getEntry(ref)
+    pipeline_def = pipeline_entry.getPipelineEntry() 
     operations = PipelineOperationsBean(pipeline_def.getCoreEntry().getOperations())
-    if operations.getTracingEnabled():
-        traceEnabled = 'SI'
-    if operations.getLoggingEnabled():
-        logLevel = operations.getLoggingLevel()
+    changed_ops = False
+    changed_entry = False
 
-    if pipelines[pl]['traceEnabled'] != traceEnabled:
-        changed = True
-        if pipelines[pl]['traceEnabled'] == 'SI':
-            operations.setTracingEnabled(True)
-        else:
-            operations.setTracingEnabled(False)
-        cambio = cambio + 'traceEnabled '
-
-    if pipelines[pl]['logLevel'] != logLevel:
-        changed = True
-        if pipelines[pl]['logLevel'] == '-':
-            operations.setLoggingEnabled(False)
-        else:
-            operations.setLoggingEnabled(True)
-            operations.setLoggingLevel(pipelines[pl]['logLevel'])
-        cambio = cambio + 'logLevel '
-        
-    if changed:
+    for k,v in mods.items():
+        if k == 'traceEnabled':
+            changed_ops = True
+            operations.setTracingEnabled(boolean_from_string(v))
+        elif k == 'logLevel':
+            changed_ops = True
+            if v == '-':
+                operations.setLoggingEnabled(False)
+            else:
+                operations.setLoggingEnabled(True)
+                operations.setLoggingLevel(v)
+        elif k == 'routesLocalNoOp':
+            changed_entry = update_pipeline_routes(pipeline_entry, info['routesLocalPipeline'])
+    if changed_entry:
         if verbose:
-            print "Cambiando",cambio,"en Pipeline:",pl
+            print "Actualizando rutas en Pipeline:",pl
+        pipeline_conf_mbean.updateEntry(ref, pipeline_entry)
+    if changed_ops:
+        if verbose:
+            print "Cambiando",' '.join(mods.keys()),"en Pipeline:",pl
         pipeline_conf_mbean.updateOperations(ref, operations)
-    return changed
+    return changed_entry or changed_ops
 
 def update_business(ref):
     bs = ref.getFullName()
